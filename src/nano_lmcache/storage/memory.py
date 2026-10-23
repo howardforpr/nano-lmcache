@@ -4,6 +4,7 @@ import sys
 from collections.abc import Callable
 
 from nano_lmcache.storage.eviction import PrefixLRUIndex
+from nano_lmcache.storage.policy import EvictionPolicy
 from nano_lmcache.storage.stats import StorageStats
 
 
@@ -15,7 +16,7 @@ class MemoryKVCache:
     particular KV-tensor representation (e.g. PyTorch tensors).
 
     Capacity can be bounded by entries, payload bytes, or both. When full, the
-    least recently used *leaf* is evicted, following the prefix-safe rules
+    configured policy ranks *leaves* (LRU by default), following the prefix-safe rules
     in `PrefixLRUIndex`: evicting an entry that still has descendants would
     strand them, since a prefix lookup could never reach them again.
 
@@ -33,8 +34,9 @@ class MemoryKVCache:
         *,
         max_bytes: int | None = None,
         size_fn: Callable[[object], int] = sys.getsizeof,
+        policy: EvictionPolicy | None = None,
     ) -> None:
-        self._index = PrefixLRUIndex(max_entries, max_bytes=max_bytes)
+        self._index = PrefixLRUIndex(max_entries, max_bytes=max_bytes, policy=policy)
         self._size_fn = size_fn
         self._values: dict[str, object] = {}
 

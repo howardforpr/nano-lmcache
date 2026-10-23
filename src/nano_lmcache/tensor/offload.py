@@ -26,6 +26,7 @@ from collections.abc import Iterator
 import torch
 
 from nano_lmcache.storage.eviction import PrefixLRUIndex
+from nano_lmcache.storage.policy import EvictionPolicy
 from nano_lmcache.storage.stats import StorageStats
 
 
@@ -45,11 +46,12 @@ class CPUOffloadKVCache:
         max_bytes: int | None = None,
         pin_memory: bool = True,
         non_blocking: bool = True,
+        policy: EvictionPolicy | None = None,
     ) -> None:
         self._device = torch.device(device)
         self._pin_memory = pin_memory
         self._non_blocking = non_blocking
-        self._index = PrefixLRUIndex(max_entries, max_bytes=max_bytes)
+        self._index = PrefixLRUIndex(max_entries, max_bytes=max_bytes, policy=policy)
         self._tensors: dict[str, torch.Tensor] = {}
 
     @property

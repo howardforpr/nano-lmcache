@@ -6,6 +6,7 @@ Run with: uv run python examples/demo_prefix_cache.py
 from nano_lmcache.core.chunking import chunk_tokens
 from nano_lmcache.core.prefix_cache import ChunkedPrefixCache
 from nano_lmcache.storage.memory import MemoryKVCache
+from nano_lmcache.storage.policy import LRU, MRU
 
 CHUNK_SIZE = 2
 NAMESPACE = "demo-model"
@@ -151,11 +152,32 @@ def run_byte_bounded() -> None:
     print(f"Rejected (no room): {storage.stats.rejected_no_room}\n")
 
 
+def run_policies() -> None:
+    """Show how the same safe leaves are ranked differently after a hit."""
+    print("=== Part 4: LRU and MRU among leaves (max_entries=3) ===\n")
+    requests = [
+        ("A", [101, 205, 1, 2]),
+        ("B", [101, 205, 3, 4]),
+        ("A again (refresh its tail)", [101, 205, 1, 2]),
+        ("C (evicts one tail)", [101, 205, 5, 6]),
+        ("A after eviction", [101, 205, 1, 2]),
+    ]
+    for policy in (LRU(), MRU()):
+        print(f"Policy: {type(policy).__name__}")
+        cache = ChunkedPrefixCache(
+            chunk_size=CHUNK_SIZE, namespace=NAMESPACE,
+            storage=MemoryKVCache(max_entries=3, policy=policy),
+        )
+        for label, tokens in requests:
+            serve_request(cache, label, tokens)
+
+
 def main() -> None:
     print("=== Nano-LMCache: Chunked Prefix Cache Demo ===\n")
     run_unbounded()
     run_bounded()
     run_byte_bounded()
+    run_policies()
 
 
 if __name__ == "__main__":

@@ -164,7 +164,8 @@ understood without a GPU or an inference engine.
 | `core/prefix_cache.py` | `ChunkedPrefixCache`: the store/lookup loop |
 | `core/metrics.py` | `CacheMetrics`: chunk-level hit/miss accounting |
 | `storage/protocol.py` | `CacheStorage` protocol: the `put`/`get` contract |
-| `storage/eviction.py` | `PrefixLRUIndex`: prefix-safe LRU bookkeeping shared by bounded backends |
+| `storage/eviction.py` | `PrefixLRUIndex`: prefix-safe admission and leaf heap shared by bounded backends |
+| `storage/policy.py` | `EvictionPolicy`: recency ranking, with LRU (default) and MRU |
 | `storage/disk.py` | `DiskKVCache`: one file per entry, survives restarts |
 | `storage/serializers.py` | `Serializer` protocol and the safe `JsonSerializer` default |
 | `storage/tiered.py` | `TieredStorage`: fast tier in front of a slow tier, write-through |
@@ -249,7 +250,8 @@ also stored. A plain per-entry LRU would break this: evicting `A` from
 The eviction rule therefore is:
 
 1. Only an entry with no descendants (a leaf) may be evicted.
-2. Among leaves, evict the least recently used. `get` refreshes recency.
+2. Among leaves, use the configured ranking policy (LRU by default).
+   Successful `get` and `put` refresh recency.
 3. The parent of the entry being inserted is never the victim.
 4. If the new entry and its ancestors cannot fit, the write is dropped
    without evicting anything, so a prompt longer than the cache keeps its
@@ -261,7 +263,30 @@ These rules live in `PrefixLRUIndex` (`storage/eviction.py`), which only
 tracks keys, parents, recency, and reported sizes, never payload objects.
 A backend asks it whether a new entry is admitted and which keys to
 evict, then moves the payloads itself, so
-memory, disk, and CPU-offload backends share one eviction policy.
+memory, disk, and CPU-offload backends share the same safety mechanism.
+Each accepts an optional `policy`; the historical `PrefixLRUIndex` name
+is kept for compatibility.
+
+`EvictionPolicy.priority(last_access)` maps an access tick to an integer;
+smaller values are evicted first. `LRU()` returns the tick, while `MRU()`
+returns its negative. The function must be deterministic and stateless.
+Equal priorities are broken by oldest access tick. Policies cannot choose
+internal nodes or override incoming-chain protection. This small interface
+supports recency-based ranking; LFU or depth-aware policies would need
+additional per-entry metadata, which is not part of this interface.
+
+```python
+from nano_lmcache.storage.memory import MemoryKVCache
+from nano_lmcache.storage.policy import MRU
+
+storage = MemoryKVCache(max_entries=64, policy=MRU())
+```
+
+The same keyword works for `DiskKVCache` and `CPUOffloadKVCache`.
+Disk recovery replays persisted access times, so either policy retains
+its ordering after a restart without changing the entry format. The
+[policy comparison](eviction-policies.md) explains why LRU wins for hot
+tails while MRU can win for repeated scans larger than the cache.
 
 One write can evict several leaves until both limits are met. After a
 leaf goes, its parent may become a candidate, but the incoming entry's
@@ -277,12 +302,12 @@ its ancestors cannot fit, the old payload and all other entries remain
 unchanged. A successful overwrite refreshes recency; shrinking frees
 bytes for later writes.
 
-Victim selection uses a min-heap of `(last_access_tick, key)` leaf
+Victim selection uses a min-heap of `(priority, last_access_tick, key)` leaf
 candidates in bounded indexes (either `max_entries` or `max_bytes` set). A new entry enters as a leaf; a hit or
 overwrite records a new tick. Old records are discarded lazily when a
 key is gone, has children, or has a newer tick. After a last child is
 evicted, its parent enters the heap using its **original last access
-tick**, so becoming a leaf does not change LRU order. The protected parent
+tick**, so becoming a leaf does not change policy order. The protected parent
 is skipped only for that admission and remains eligible for later writes.
 
 Lazy records are periodically compacted once the heap exceeds both 64
@@ -496,7 +521,8 @@ backend may hand chunks back on the CPU.
 excluding keys, bookkeeping, and allocator overhead. The read-only
 `max_bytes` property is `None` by default; `nbytes` reports the actual cached
 payload total. If `max_entries` is also set, both limits must be satisfied.
-Only LRU leaves may be evicted. A tensor whose required prefix cannot fit
+Only leaves may be evicted, ranked by the selected policy (LRU by default).
+A tensor whose required prefix cannot fit
 is rejected without evicting existing data. Overwrites account for the new
 tensor size. Use `device="cpu", pin_memory=False` to run without a GPU.
 
@@ -545,8 +571,8 @@ The storage interface is in place: cache logic depends on the
 `CacheStorage` protocol, so file, CPU, GPU, or remote backends can be
 added without touching the cache loop. Capacity limits and prefix-safe
 eviction, including byte-based capacity, are implemented in `MemoryKVCache`
-and `CPUOffloadKVCache`;
-other eviction policies are future work.
+and `CPUOffloadKVCache`. Recency-based eviction policies can be selected
+independently of the prefix-safety mechanism.
 
 Those backends are not implemented ahead of need.
 

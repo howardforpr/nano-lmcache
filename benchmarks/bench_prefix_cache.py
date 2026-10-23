@@ -7,6 +7,7 @@ example when optimizing eviction:
     uv run python benchmarks/bench_prefix_cache.py --chunks 100 1000 --capacity 64
     uv run python benchmarks/bench_prefix_cache.py --capacity 8192 \
         --churn-prompts 64 --churn-chunks 1024
+    uv run python benchmarks/bench_prefix_cache.py --policy-only --capacity 32 64 128
 
 Timings are wall-clock seconds for one store or lookup of a whole prompt,
 taken as the best of several repeats to reduce noise. They are only
@@ -17,12 +18,15 @@ through mostly internal nodes in the original linear scan.
 """
 
 import argparse
+import random
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from nano_lmcache.core.metrics import CacheMetrics
 from nano_lmcache.core.prefix_cache import ChunkedPrefixCache
 from nano_lmcache.storage.memory import MemoryKVCache
+from nano_lmcache.storage.policy import LRU, MRU, EvictionPolicy
 
 CHUNK_SIZE = 16
 DEFAULT_CHUNK_COUNTS = (10, 100, 1000)
@@ -188,6 +192,66 @@ def format_churn(result: ChurnResult) -> str:
     )
 
 
+def shared_prompt_trace(pattern: str, requests: int = 2000) -> list[list[int]]:
+    """Two 4-chunk system prompts, each followed by an 8-chunk user tail.
+
+    `hot` repeats four popular tails 80% of the time, with unique tails
+    otherwise (seed 0). `scan` cycles through 32 distinct tails. Both use
+    the same prompt lengths and alternate system prompts by tail ID.
+    """
+    if pattern not in {"hot", "scan"}:
+        raise ValueError("pattern must be 'hot' or 'scan'")
+    rng = random.Random(0)
+    trace = []
+    for request in range(requests):
+        if pattern == "hot":
+            tail = rng.randrange(4) if rng.random() < 0.8 else 4 + request
+        else:
+            tail = request % 32
+        system_tokens = [-(tail % 2 + 1)] * (4 * CHUNK_SIZE)
+        trace.append(system_tokens + [tail + 1] * (8 * CHUNK_SIZE))
+    return trace
+
+
+def run_policy_workload(
+    trace: Sequence[Sequence[int]],
+    *,
+    policy: EvictionPolicy,
+    capacity: int | None,
+) -> CacheMetrics:
+    """Replay a cold-cache trace, looking up before writing only its misses."""
+    cache = ChunkedPrefixCache(
+        chunk_size=CHUNK_SIZE,
+        namespace="policy-bench",
+        storage=MemoryKVCache(max_entries=capacity, policy=policy),
+    )
+    for tokens in trace:
+        matched = cache.lookup(tokens).matched_chunks
+        missing = len(tokens) // CHUNK_SIZE - matched
+        cache.store(tokens, ["kv"] * missing, start_chunk=matched)
+    return cache.metrics
+
+
+def print_policy_comparison(capacities: Sequence[int | None], requests: int) -> None:
+    """Report chunk hit rates on identical traces, including cold misses."""
+    print(f"\nShared system prompts and diverse tails ({requests} requests, seed=0):")
+    print(
+        f"{'workload':>8} {'capacity':>10} {'policy':>6} "
+        f"{'hits/total':>14} {'hit rate':>10}"
+    )
+    for pattern in ("hot", "scan"):
+        trace = shared_prompt_trace(pattern, requests)
+        for capacity in capacities:
+            for policy in (LRU(), MRU()):
+                metrics = run_policy_workload(trace, policy=policy, capacity=capacity)
+                limit = "unbounded" if capacity is None else str(capacity)
+                print(
+                    f"{pattern:>8} {limit:>10} {type(policy).__name__:>6} "
+                    f"{metrics.hit_chunks:>7}/{metrics.total_chunks:<6} "
+                    f"{metrics.hit_rate:>9.2%}"
+                )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--chunks", type=int, nargs="+", default=DEFAULT_CHUNK_COUNTS)
@@ -199,6 +263,8 @@ def main() -> None:
         help="entry limits to test; an unbounded run is always included",
     )
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--policy-only", action="store_true", help="skip timing runs")
+    parser.add_argument("--policy-requests", type=int, default=2000)
     parser.add_argument(
         "--churn-prompts",
         type=int,
@@ -214,8 +280,13 @@ def main() -> None:
     args = parser.parse_args()
     if args.churn_prompts <= 0 or args.churn_chunks <= 0:
         parser.error("--churn-prompts and --churn-chunks must be positive")
+    if args.policy_requests <= 0:
+        parser.error("--policy-requests must be positive")
 
     capacities: list[int | None] = [None, *args.capacity]
+    if args.policy_only:
+        print_policy_comparison(capacities, args.policy_requests)
+        return
     print(f"chunk_size={CHUNK_SIZE}, best of {args.repeats} repeats\n")
     print(format_table(run_benchmark(args.chunks, capacities, args.repeats)))
 

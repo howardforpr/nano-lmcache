@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import cast
 
 from nano_lmcache.storage.eviction import PrefixLRUIndex
+from nano_lmcache.storage.policy import EvictionPolicy
 from nano_lmcache.storage.serializers import JsonSerializer, Serializer
 from nano_lmcache.storage.stats import StorageStats
 
@@ -70,11 +71,12 @@ class DiskKVCache:
         *,
         max_entries: int | None = None,
         serializer: Serializer | None = None,
+        policy: EvictionPolicy | None = None,
     ) -> None:
         self._directory = Path(directory)
         self._directory.mkdir(parents=True, exist_ok=True)
         self._serializer = serializer if serializer is not None else JsonSerializer()
-        self._index = PrefixLRUIndex(max_entries)
+        self._index = PrefixLRUIndex(max_entries, policy=policy)
         # Last-used times are written as file mtimes. Keeping them strictly
         # increasing makes the order exact even when two accesses land in
         # the same clock tick.
