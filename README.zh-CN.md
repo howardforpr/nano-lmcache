@@ -4,11 +4,11 @@
 
 [English](README.md) | 简体中文
 
-本文译自英文版 [README.md](README.md) commit `2aa6d0a`，内容以英文版为准。架构说明见 [docs/zh-CN/architecture.md](docs/zh-CN/architecture.md)。
+本文译自英文版 [README.md](README.md) commit `50b4b4a2df7a0dca08db5e31939c47423981e49f`，内容以英文版为准。架构说明见 [docs/zh-CN/architecture.md](docs/zh-CN/architecture.md)。
 
 # nano-lmcache
 
-一个循序渐进的 KV 缓存复用教学项目，从纯 Python 原型逐步发展到真实 GPU 张量和 vLLM 集成。
+一个循序渐进的 KV 缓存复用教学项目，从纯 Python 原型逐步发展到真实 GPU 张量，以及 nano-vLLM 推理引擎的外部 KV 缓存。
 
 nano-lmcache 是一个教学项目，而不是 [LMCache](https://github.com/LMCache/LMCache) 的重新实现或替代品。它将核心概念逐一重新实现，每个概念都配有测试和可运行示例，帮助学习者日后阅读 LMCache 和 vLLM 等生产级系统，并理解它们的设计原因。
 
@@ -37,23 +37,34 @@ uv run python examples/demo_chunking.py       # 单独演示分块键
 uv run python examples/demo_prefix_cache.py   # 完整缓存流程和指标
 uv run python examples/demo_disk_cache.py     # 连续运行两次，验证重启后的复用
 uv run python examples/demo_tiered_storage.py # 内存层位于磁盘层之前
+uv run python -m nano_lmcache.inspect /path/to/cache  # 检查磁盘缓存
+uv run python -m nano_lmcache.inspect /path/to/cache --json  # JSON 输出
 ```
 
 使用真实模型（需要执行 `uv sync --extra hf`）：
 
 ```bash
 uv run python examples/demo_kv_reuse.py --model Qwen/Qwen3-0.6B
-uv run python examples/demo_kv_reuse.py --device cuda --offload
-uv run python examples/demo_kv_reuse.py --device cuda --offload --disk /tmp/kv
+uv run python examples/demo_kv_reuse.py --device cuda --offload  # KV 保存在 CPU 内存中
+uv run python examples/demo_kv_reuse.py --device cuda --offload --disk /tmp/kv  # 连续运行两次
+```
+
+作为 nano-vLLM 的外部 KV 缓存使用（需要 Linux、NVIDIA GPU，以及执行 `uv sync --extra hf --group nanovllm`）：
+
+```bash
+uv run python examples/demo_nanovllm.py --model /path/to/Qwen3-0.6B  # 连续运行两次
 ```
 
 前缀缓存示例会使用同一个缓存处理四个请求，并输出每个分块的命中或未命中情况，以及累计复用指标。
 
+刚开始学习 KV 缓存？[术语表与常见问题](docs/glossary.md)提供了简短的定义和适合初学者的解答。
+
 ## 路线图
 
 1. **Nano（已完成）**：Token 分块、感知前缀的分块键、内存后端、连续前缀查询，以及命中/未命中指标。
-2. **Mini（进行中）**：存储接口和有界且保持前缀安全的淘汰机制已经就绪；磁盘和分层后端即将实现。
-3. **GPU 和 vLLM**：使用真实模型验证真实 KV 张量、GPU 到 CPU 的卸载，以及 vLLM KV 连接器。
+2. **Mini（已完成）**：存储接口、有界且保持前缀安全的淘汰机制，以及磁盘和内存 + 磁盘分层后端。
+3. **GPU（已完成）**：使用真实模型验证真实 KV 张量、GPU 到 CPU 的卸载，以及 GPU -> CPU -> 磁盘的存储层级。
+4. **nano-vLLM 集成（第一版已完成，后续任务开放认领）**：nano-lmcache 作为 [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm) GPU 前缀缓存之后的外部 KV 缓存。设计见 [docs/nanovllm-integration.md](docs/nanovllm-integration.md)；适用场景见 [docs/nanovllm-benchmark.md](docs/nanovllm-benchmark.md)。
 
 完整任务列表请参阅 [ROADMAP.md](ROADMAP.md)。欢迎贡献者认领开放任务。
 

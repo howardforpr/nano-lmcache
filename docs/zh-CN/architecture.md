@@ -1,7 +1,7 @@
 
 [English](../architecture.md) | [简体中文](architecture.md)
 
-本文译自英文版 [docs/architecture.md](../architecture.md) commit `2aa6d0a`，内容以英文版为准。
+本文译自英文版 [docs/architecture.md](../architecture.md) commit `50b4b4a2df7a0dca08db5e31939c47423981e49f`，内容以英文版为准。
 
 # 架构
 
@@ -154,6 +154,10 @@ graph LR
 | `storage/memory.py` | `MemoryKVCache`：可选有界容量、采用前缀安全 LRU 策略的内存存储 |
 | `tensor/kv_chunks.py` | `split_kv` / `join_kv`：在逐层 KV 张量与分块张量之间转换（需要 torch） |
 | `tensor/offload.py` | `CPUOffloadKVCache`：将 GPU 分块保存在页锁定的 CPU 内存中（需要 torch） |
+| `integrations/nanovllm/layout.py` | `KVBlockLayout`：定义 nano-vLLM 块的字节内容取决于哪些因素，以及其缓存命名空间 |
+| `integrations/nanovllm/external_cache.py` | `NanoVLLMExternalCache`：在 L2 中统计、读取和存储 nano-vLLM 块 |
+| `integrations/nanovllm/engine.py` | `attach()`：在运行中的 nano-vLLM 引擎内恢复 L2 命中的块并存储新块（需要 nano-vLLM） |
+| `integrations/nanovllm/kv_blocks.py` | `export_block` / `import_block`：在 nano-vLLM KV 块与分块之间转换（需要 torch） |
 | `tensor/serializers.py` | `TensorSerializer`：为 `DiskKVCache` 提供安全的张量编码（需要 torch） |
 | `tensor/hf.py` | `run_with_prefix_cache`：与 HuggingFace 模型一起复用前缀 KV（需要 torch 和 transformers） |
 
@@ -167,7 +171,27 @@ graph LR
 
 ### 容量与淘汰
 
-`MemoryKVCache(max_entries=N)` 将缓存限制为最多 N 个条目，每个条目对应一个分块数据载荷。如果不指定 `max_entries`，缓存容量不受限制，行为与之前相同。
+`MemoryKVCache(max_entries=N)` 将缓存限制为最多 N 个条目，每个条目对应一个分块数据载荷。`MemoryKVCache(max_bytes=B, size_fn=...)` 将记录的数据载荷大小总和限制为 B 字节。两个限制都可以省略；如果同时设置，则**必须同时满足**。两个都未设置时，缓存容量不受限制。`max_bytes` 必须为正整数。
+
+`CPUOffloadKVCache` 也提供 `max_bytes`，在共享的 `PrefixLRUIndex` 中使用每个张量精确的 `value.nbytes` 作为数据载荷大小。`DiskKVCache` 仅限制条目数量；它在接纳条目时不传入 `size_bytes`，因此索引中记录的大小默认为零。
+
+可注入的 `size_fn(value) -> int` 必须返回非负整数（允许为零）。默认使用 `sys.getsizeof`，它只测量 Python 对象本身的浅层大小，不递归计入引用对象或张量底层存储的大小。
+
+**对于张量或包含字节串的容器，请传入自定义 `size_fn`。** 默认函数可能只计入很小的 Python 包装对象，而忽略庞大的底层缓冲区或引用的字节串，因此无法为这类数据载荷实施预期的内存限制。张量的大小函数可以返回 `value.nelement() * value.element_size()`；容器的大小函数应显式测量其中的数据载荷。例如，对于仅包含 `bytes` 的数据载荷：
+
+```python
+def byte_payload_size(value: object) -> int:
+    if not isinstance(value, bytes):
+        raise TypeError("expected bytes")
+    return len(value)
+
+
+storage = MemoryKVCache(max_entries=100, max_bytes=1024, size_fn=byte_payload_size)
+```
+
+容量限制只涵盖该函数报告的数据载荷大小，不包括键、索引元数据和容器开销，也不是进程内存上限。即使没有设置字节容量限制，也可以通过 `storage.nbytes` 读取记录的总量。每次 `put` 时会测量数据载荷，读取时不会测量。不要原地调整已缓存数据载荷的大小：只有再次成功 `put`，记录的大小才会更新。如果大小函数抛出异常或返回无效结果，会在修改任何条目、最近使用顺序或计数器之前报错。
+
+大小测量刻意安排在检查父节点是否缺失之前，因此即使写入将因缺少父节点而被拒绝，也会产生测量开销。
 
 分块键以链式方式关联：每个键都由前一个分块的键推导而来，查找从链的起点开始，并在第一次未命中时停止。因此，只有在所有祖先条目都仍然存在时，一个已存储的分块才能被复用。普通的逐条目 LRU 淘汰会破坏这一性质：如果从 `A -> B -> C -> D` 中淘汰 `A`，虽然 `B`、`C`、`D` 仍在内存中，却再也无法访问。
 
@@ -176,17 +200,27 @@ graph LR
 1. 只有没有后代条目的条目（叶节点）才能被淘汰。
 2. 在所有叶节点中，优先淘汰最近最少使用的条目。调用 `get` 会刷新其最近使用记录。
 3. 正在插入的新条目的父节点绝不会被选为淘汰对象。
-4. 如果没有可淘汰的条目，就丢弃新条目。因此，当提示词长于缓存容量时，缓存会保留能够容纳的最长前缀。
+4. 如果无法容纳新条目及其祖先条目，则拒绝写入，且不淘汰任何条目。因此，当提示词长于缓存容量时，缓存会保留能够容纳的最长前缀。单个数据载荷大于 `max_bytes` 的情况也遵循此规则。
 5. 如果某个条目的父节点未被存储，则丢弃该条目。
 
-这些规则由 `PrefixLRUIndex`（`storage/eviction.py`）实现。它只跟踪键、父节点和最近使用顺序。存储后端会向它询问新条目能否被接纳，以及哪些键需要淘汰，然后由后端自行处理数据载荷。因此，内存、磁盘和 CPU 卸载后端可以共享同一套淘汰策略。
+这些规则由 `PrefixLRUIndex`（`storage/eviction.py`）实现。它只跟踪键、父节点、最近使用顺序和报告的大小，不保存数据载荷对象。存储后端会向它询问新条目能否被接纳，以及哪些键需要淘汰，然后由后端自行处理数据载荷。因此，内存、磁盘和 CPU 卸载后端可以共享同一套淘汰策略。
+
+一次写入可以淘汰多个叶节点，直到两个限制都满足。叶节点被淘汰后，其父节点可能成为候选对象，但新条目的祖先链始终受到保护。在删除任何候选对象之前，接纳检查会先确认能否容纳这条必需的前缀链，因此被拒绝的写入会保留所有现有数据及其最近使用顺序。
+
+覆盖已有键时，会保留原来的父节点和条目数量，测量替换后的数据载荷，并按大小差值调整 `nbytes`。被覆盖的键及其祖先仍受保护；它的后代可能被淘汰，以便容纳更大的数据载荷。如果无法容纳替换后的数据载荷及其祖先，旧数据载荷和所有其他条目都会保持不变。成功覆盖会刷新最近使用记录；数据载荷缩小则会释放字节容量，供之后的写入使用。
+
+有界索引（设置了 `max_entries` 或 `max_bytes`）使用由 `(last_access_tick, key)` 组成的叶节点候选最小堆来选择淘汰对象。新条目以叶节点身份加入；命中或覆盖时会记录新的访问时刻。当某个键已不存在、已有子节点或已有更新的访问时刻时，其旧记录会被惰性丢弃。最后一个子节点被淘汰后，父节点会以其**原来的最后访问时刻**进入堆，因此变成叶节点不会改变 LRU 顺序。受保护的父节点仅在当前接纳过程中被跳过，之后的写入仍可选择它。
+
+当堆中的记录数同时超过 64 和已存储条目数的两倍时，会清理惰性记录。这使辅助内存保持为 O(n)，候选维护的均摊时间为 O(log n)。单次操作仍可能需要丢弃大量过期记录或重建堆。64 条记录的下限可避免小缓存频繁重建；当记录数超过 2n 时，至少有 n 条是过期或重复的，因为当前叶节点最多只需要 n 条记录。O(n) 的重建成本均摊到之前的添加操作上，每次为 O(1)，但触发重建的操作可能出现延迟峰值。无界索引不维护候选集合或访问时刻。这样既避免了每次淘汰时重新扫描内部节点，又保留了原有的完整策略，包括磁盘恢复重放最近使用顺序后的行为。
+
+简单的 FIFO 式叶节点列表可以做到 O(1) 更新，但将刚成为叶节点的父节点追加到末尾，会把它视为最近使用过的条目，从而改变淘汰顺序。堆可以保持现有行为，代价是在有界写入和叶节点命中时增加管理开销。[性能报告](../eviction-performance.md)比较了这两种设计，包括短链开销和深链收益。
 
 这些规则共同保证：每个已存储条目的完整祖先链也都处于存储状态，从而避免淘汰操作留下无法访问的条目。调用方通过 `put(key, value, parent_key=...)` 传递链式关系；`ChunkedPrefixCache` 的匹配逻辑不需要修改，也不必了解淘汰机制。
 
 淘汰情况可以通过 `MemoryKVCache.stats`（一个 `StorageStats` 实例）观察：
 
 - `evictions`：为了腾出空间而删除的条目数。
-- `rejected_no_room`：由于唯一可淘汰的条目是新条目自己的父节点，因此被丢弃的写入数。
+- `rejected_no_room`：由于条目数量或字节容量限制无法容纳数据载荷及其必需的祖先条目，因此被丢弃的写入数。
 - `rejected_missing_parent`：由于父节点未被存储，因此被丢弃的写入数。
 
 这些指标属于存储层，而不是 `CacheMetrics`：只有存储层知道何时淘汰条目或拒绝写入，而 `CacheMetrics` 负责统计查找结果。结合两者，可以区分“工作集超出了缓存容量”（淘汰次数不断增加）和“提示词之间不再共享前缀”（命中率下降但淘汰很少）。
@@ -201,18 +235,58 @@ graph LR
 
 `run_with_prefix_cache` 会查找最长的已缓存前缀，从匹配到的分块重建 `past_key_values`，只让模型处理剩余 token，并存储整个序列的分块，以供下一个请求复用。即使提示词已被完全缓存，模型仍然需要重新计算最后一个 token，因为它必须执行一次前向计算才能生成下一个 token 的 logits。
 
-这种复用是精确的，而不是近似的。在因果模型中，一个 token 的 K 和 V 只取决于该 token 及其之前的 token，因此相同的前导 token 会产生相同的 K/V。但如果相同 token 出现在不同的前缀之后，其 K/V 并不相同，这也是分块键需要对完整前缀进行哈希计算的原因。测试会将复用前缀后的 logits 与从头执行前向计算的结果进行比较，并检查前缀不同的分块是否具有不同的 K/V。
+使用无损存储时，前缀复用会保留缓存中的 K/V。在因果模型中，一个 token 的 K 和 V 只取决于该 token 及其之前的 token，因此相同的前导 token 会产生相同的 K/V。但如果相同 token 出现在不同的前缀之后，其 K/V 并不相同，这也是分块键需要对完整前缀进行哈希计算的原因。测试会将复用前缀后的 logits 与从头执行前向计算的结果进行比较，并检查前缀不同的分块是否具有不同的 K/V。低精度下，完整预填充与仅计算后缀的执行仍可能存在数值差异。下文可选的 INT8 序列化器还会通过量化改变缓存中的 K/V。
 
 ### 磁盘存储
 
 `DiskKVCache(directory)` 为每个条目保存一个文件，因此即使计算该分块的进程退出，缓存内容也能保留下来。这是外部 KV 缓存相较于推理引擎自身前缀缓存的主要优势：后者通常驻留在 GPU 内存中，进程重启后就会丢失。
 
-- **文件名**：使用键的 SHA-256 哈希值，因此任何键都无法将文件路径指向缓存目录之外。每个文件开头都有一个 JSON 头部，用于记录键及其 `parent_key`，使新进程能够重建前缀链。
+- **文件名**：使用键的 SHA-256 哈希值，因此任何键都无法将文件路径指向缓存目录之外。每个文件开头都有一个 JSON 头部，用于记录键、其 `parent_key` 及数据载荷的 CRC32 校验和。父节点关系使新进程能够重建前缀链；校验和则使损坏的数据载荷表现为缓存未命中，而不是反序列化失败。
 - **崩溃安全性**：写入操作先写入临时文件，再将其重命名为正式文件。同一目录内的重命名是原子操作，因此发生崩溃时，可能留下旧文件、新文件或临时文件，但不会留下只写入一半的条目。被淘汰的条目始终是叶节点，因此逐个删除不会留下孤立条目。
-- **恢复**：打开缓存时，会删除遗留的临时文件、无法读取的文件，以及祖先条目缺失的条目，然后按照先父节点、后子节点的顺序重建 `PrefixLRUIndex`。文件修改时间用于记录最近使用情况，因此重启后也能恢复 LRU 顺序。
+- **恢复**：打开缓存时，会删除遗留的临时文件、无法读取的文件、数据载荷校验和缺失或不匹配的条目，以及祖先条目缺失的条目，然后按照先父节点、后子节点的顺序重建 `PrefixLRUIndex`。在支持校验和之前写入的条目会被丢弃，之后按需重新生成。文件修改时间用于记录最近使用情况，因此重启后也能恢复 LRU 顺序。
 - **序列化**：序列化方式可以替换。默认使用 JSON，而不是 `pickle`：反序列化 pickle 会执行写入文件的人所指定的代码，而缓存目录很容易被共享。对于 KV 张量，应使用 `TensorSerializer`（`tensor/serializers.py`）：它使用 `torch.save` 写入，并通过 `torch.load(weights_only=True)` 读取。受限制的反序列化器只重建张量和普通容器，并拒绝其他类。
 
 同一时间只能有一个进程向同一个目录写入，因为每个进程都会维护自己的索引。
+
+### 可选的 INT8 KV 压缩
+
+`QuantizedTensorSerializer` 以一定的数值精度换取更小的磁盘数据载荷。它始终需要显式启用；`TensorSerializer` 仍是张量存储的无损选择。对于形状为 `[layers, 2, kv_heads, tokens, head_dim]` 的分块，它沿 token 轴（`-2`）为每一层、K/V、注意力头和通道计算一个 FP32 缩放因子：
+
+```text
+scale = max(abs(values_across_tokens)) / 127
+quantized = round(values / scale), clamped to [-127, 127]
+restored = quantized * scale, cast back to the original dtype
+```
+
+全零通道使用缩放因子 1，并保持为零。逐通道处理可以避免某个通道的异常值降低其他通道的精度。该序列化器接受 FP16、BF16 和 FP32 分块，保留形状和数据类型，并在 CPU 上还原。输入不会被修改，加载使用 `torch.load(weights_only=True)`。
+
+执行 `uv sync --locked --group tensor-test` 后，可以在 CPU 上尝试一次存取：
+
+```python
+import tempfile
+
+import torch
+
+from nano_lmcache.storage.disk import DiskKVCache
+from nano_lmcache.tensor.serializers import QuantizedTensorSerializer
+
+torch.manual_seed(0)
+original = torch.randn(2, 2, 2, 16, 8, dtype=torch.float16)
+with tempfile.TemporaryDirectory() as directory:
+    disk = DiskKVCache(directory, serializer=QuantizedTensorSerializer())
+    disk.put("prefix-0", original)
+    restored = disk.get("prefix-0")
+    print(restored.shape, restored.dtype, restored.device)
+    print("maximum error:", (restored.float() - original.float()).abs().max().item())
+```
+
+更换序列化器时请使用独立的缓存目录：已有的无损张量文件与量化文件使用不同的数据载荷格式。读回量化分块不会恢复已经丢弃的精度。
+
+每个 INT8 值占一个字节，但每个通道的缩放因子还需四个字节。不计序列化开销时，一个包含 `T` 个 token 的分块平均每个值约占 `1 + 4 / T` 字节，而 FP16/BF16 占两个字节。16 个 token 时，压缩比约为 1.6 倍；分块很短时，大小可能完全不减。编码和解码也需要时间，因此仅凭文件变小不能判断延迟是否改善。
+
+误差是否可接受取决于模型和工作负载。应在有代表性的输入和生成长度上，与从头计算的结果比较最大 K/V 误差、logits 误差、贪心解码的 token 一致率及任务质量。启用压缩之前，应为该工作负载确定验收阈值；不存在通用的安全误差阈值。微小的 logit 变化也可能改变得分最高的 token，并影响后续生成。这正是量化默认关闭的原因，也说明微型模型上的检查不能保证其他模型生成等价的结果。
+
+[压缩实验](../quantized-kv.md)提供了 CPU 复现命令、测得的大小和耗时、分别统计的 K/V 误差，以及 G1 完整预填充与无损/INT8 复用的对比。练习：将分块的 token 数从 16 改为 4 或 32，先预测缩放因子的开销会如何影响压缩比，再实际测量。
 
 ### 分层存储
 
@@ -220,6 +294,7 @@ graph LR
 
 - **写穿透（Write-through）**：每次 `put` 都先写入慢速层，再写入快速层。写回策略（仅在内存淘汰条目时才将其写入磁盘）虽然可以减少写入次数，却会破坏前缀安全性：内存淘汰某个叶节点时，它的父节点可能仍然只存在于内存中，因此磁盘层会因无法保证前缀完整而拒绝该条目，最终导致分块丢失。写穿透也意味着发生崩溃时，已经存储的分块不会只存在于内存层。
 - **命中时提升（Promote on hit）**：如果慢速层命中，就将该条目复制到快速层，并使用慢速层记录的父节点。前缀查找按从根节点到子节点的顺序进行，因此通常会先提升父节点，再提升子节点。如果快速层因空间不足而拒绝父节点，也会拒绝子节点；此时慢速层仍然可以提供这两个条目。
+- **覆盖写入被拒绝时**：`MemoryKVCache` 和 `CPUOffloadKVCache` 提供 `try_put` 来报告是否接纳写入，并提供 `invalidate` 来删除某个键及其后代。如果快速层拒绝覆盖写入，`TieredStorage` 会使该子树失效，以便读取慢速层中更新后的副本。删除的条目计入淘汰次数；无关条目的最近使用顺序保持不变。单独调用 `put` 时，被拒绝的写入仍会保留旧数据载荷。可能拒绝覆盖写入的自定义快速层应实现这些方法。
 - **不变量**：每一层都独立保存完整的前缀链，因此两层存储内容的并集也能保持这一性质。随机测试会在每一步操作后检查该性质。
 
 `TieredStorage.tier_stats` 会统计每一层的命中次数、未命中次数和提升次数，用于观察快速层能够容纳多少工作集数据。
@@ -227,6 +302,8 @@ graph LR
 ### GPU 到 CPU 的卸载
 
 `CPUOffloadKVCache(device="cuda")` 将分块张量保存在 CPU 内存中，命中时再将其复制回 GPU。GPU 内存需要由模型权重和正在运行的请求的 KV 缓存共同使用，而 CPU 内存通常大得多，因此卸载可以让服务器保留更多可复用的前缀。它实现了 `CacheStorage` 协议，并使用 `PrefixLRUIndex` 进行淘汰，所以既可以单独使用，也可以作为 `TieredStorage` 的快速层。`run_with_prefix_cache` 会将复用的分块移动到模型所在的设备，因此任何后端都可以在 CPU 上返回分块。
+
+`CPUOffloadKVCache(max_bytes=B)` 将缓存的张量数据载荷限制为 B 字节，不包括键、管理数据和分配器开销。只读属性 `max_bytes` 默认为 `None`；`nbytes` 报告实际缓存的数据载荷总量。如果同时设置 `max_entries`，则必须同时满足两个限制。只能淘汰最近最少使用的叶节点。如果无法容纳张量及其必需的前缀，会拒绝写入，且不淘汰现有数据。覆盖写入会计入新张量的大小。使用 `device="cpu", pin_memory=False` 可以在没有 GPU 的环境中运行。
 
 以下两个复制细节很重要。数据来自在 RTX 4090（PCIe）上运行的 `benchmarks/bench_offload.py` 测试；每次复制的数据量为 28 MiB（一个采用 bfloat16 的 256-token Qwen3-0.6B 分块）：
 
@@ -252,15 +329,17 @@ TieredStorage(
 
 模型在 GPU 上执行计算，缓存分块保存在页锁定的 CPU 内存中，并且每个分块都会写入磁盘，因此进程重启后仍然可以复用它们。运行 `examples/demo_kv_reuse.py --offload --disk DIR` 就可以演示这一流程。
 
+快速层设置了字节容量限制时，即使提升因容量不足或父节点缺失而被拒绝，磁盘命中仍会返回数据；每一层都保留自己完整的前缀链。
+
 ## Mini：扩展缓存模型
 
-存储接口已经就绪：缓存逻辑依赖 `CacheStorage` 协议，因此可以在不修改缓存处理流程的情况下添加文件、CPU、GPU 或远程存储后端。`MemoryKVCache` 已实现容量限制和前缀安全的淘汰机制；其他淘汰策略以及基于字节数的容量限制仍属于未来工作。
+存储接口已经就绪：缓存逻辑依赖 `CacheStorage` 协议，因此可以在不修改缓存处理流程的情况下添加文件、CPU、GPU 或远程存储后端。`MemoryKVCache` 和 `CPUOffloadKVCache` 已实现容量限制（包括基于字节数的容量限制）和前缀安全的淘汰机制；其他淘汰策略仍属于未来工作。
 
 这些后端不会在尚无需求时提前实现。
 
 ## 推理引擎集成
 
-后续阶段将探索 KV 张量的处理，以及如何与 vLLM 等推理引擎集成。
+nano-lmcache 作为 nano-vLLM 自身 GPU 前缀缓存（L1）之后的外部 KV 缓存（L2）。设计说明（包括 `integrations/nanovllm/kv_blocks.py` 中的块格式）见 [nanovllm-integration.md](../nanovllm-integration.md)。
 
 核心包应始终保持独立、易于理解并且可测试。只有在确实需要时，才应引入集成特定的依赖项。
 
