@@ -63,7 +63,9 @@ uv run python examples/demo_nanovllm.py --model /path/to/Qwen3-0.6B  # run twice
 The prefix-cache demo serves four requests against one cache and prints
 per-chunk hit/miss decisions plus cumulative reuse metrics.
 
-New to KV cache concepts? Read the [Glossary and FAQ](docs/glossary.md) for short definitions and beginner-friendly answers.
+New to KV cache concepts? Start with the
+[guided first experiment](docs/tutorial/README.md), then use the
+[Glossary and FAQ](docs/glossary.md) for short definitions.
 
 ## Roadmap
 

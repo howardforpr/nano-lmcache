@@ -129,6 +129,10 @@ open an issue to discuss it.
 out of time to first token, and N6, which makes the disk tier worth reading
 (see `docs/nanovllm-benchmark.md`).
 
+**Learning path:** [Start here and run your first experiment](docs/tutorial/README.md).
+The [teaching documentation roadmap](https://github.com/Dami-wq-k03/nano-lmcache/issues/63)
+tracks further chapter-sized contributions.
+
 **Dependencies:**
 
 ```mermaid
