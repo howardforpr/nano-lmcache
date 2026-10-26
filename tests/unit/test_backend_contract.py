@@ -9,6 +9,7 @@ import pytest
 from nano_lmcache.core.prefix_cache import ChunkedPrefixCache
 from nano_lmcache.storage.disk import DiskKVCache
 from nano_lmcache.storage.memory import MemoryKVCache
+from nano_lmcache.storage.remote import RemoteKVCache
 from nano_lmcache.storage.tiered import TieredStorage
 
 BACKENDS = {
@@ -23,10 +24,14 @@ BACKENDS = {
 }
 
 
-@pytest.fixture(params=sorted(BACKENDS))
-def make_cache(request, tmp_path):
+@pytest.fixture(params=[*sorted(BACKENDS), "remote"])
+def make_cache(request, tmp_path, serve_cache):
     def factory(max_entries=None):
-        storage = BACKENDS[request.param](tmp_path, max_entries)
+        if request.param == "remote":
+            server = serve_cache(MemoryKVCache(max_entries=max_entries))
+            storage = RemoteKVCache(server.server_address)
+        else:
+            storage = BACKENDS[request.param](tmp_path, max_entries)
         return ChunkedPrefixCache(
             chunk_size=2, namespace="model-a", storage=storage
         )

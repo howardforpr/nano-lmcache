@@ -37,6 +37,9 @@ graph TD
     PC --> MET
     PC -->|"put / get via CacheStorage"| ST
     ST -.->|implemented by| MEM
+    ST -.->|implemented by| REM["RemoteKVCache<br/>storage/remote.py"]
+    REM -->|"TCP: put / batched get"| SRV["CacheServer<br/>server.py"]
+    SRV -->|"put / get"| MEM
     MEM --> SS
     ST -.->|"future backends"| FUT["disk, tiered, GPU offload"]
 ```
@@ -107,13 +110,19 @@ sequenceDiagram
 
     C->>P: lookup(token_ids)
     P->>P: split into chunks, keep complete chunks only
-    loop each complete chunk, in order
-        P->>P: key = make_chunk_key(chunk, prefix_key)
-        P->>S: get(key)
-        alt payload found
-            S-->>P: payload (hit)
-        else None
-            S-->>P: None (miss, stop here)
+    alt backend supports batched prefix reads
+        P->>P: build keys for all complete chunks
+        P->>S: get_many(keys)
+        S-->>P: leading hits, stopping at the first miss
+    else ordinary backend
+        loop each complete chunk, in order
+            P->>P: key = make_chunk_key(chunk, prefix_key)
+            P->>S: get(key)
+            alt payload found
+                S-->>P: payload (hit)
+            else None
+                S-->>P: None (miss, stop here)
+            end
         end
     end
     P->>M: record_lookup(hits, remaining chunks as misses, hit tokens)
@@ -164,6 +173,8 @@ understood without a GPU or an inference engine.
 | `core/prefix_cache.py` | `ChunkedPrefixCache`: the store/lookup loop |
 | `core/metrics.py` | `CacheMetrics`: chunk-level hit/miss accounting |
 | `storage/protocol.py` | `CacheStorage` protocol: the `put`/`get` contract |
+| `storage/remote.py` | `RemoteKVCache`: TCP client, with optional batched prefix reads |
+| `server.py` | `CacheServer`: share a backend between processes using only the standard library |
 | `storage/eviction.py` | `PrefixLRUIndex`: prefix-safe LRU bookkeeping shared by bounded backends |
 | `storage/disk.py` | `DiskKVCache`: one file per entry, survives restarts |
 | `storage/serializers.py` | `Serializer` protocol and the safe `JsonSerializer` default |
@@ -384,6 +395,48 @@ lives in GPU memory and is lost on restart.
 
 Only one process should write to a directory at a time, since each keeps
 its own index.
+
+### Shared cache server
+
+`CacheServer(storage)` exposes a thread-safe `CacheStorage` over TCP, so
+separate engine processes can reuse the same cache. It defaults to
+localhost, uses one handler thread per connection, and delegates parent
+links and eviction to the backend. A disk-backed server owns the one
+`DiskKVCache` instance; clients do not open its directory themselves.
+
+`RemoteKVCache(address)` implements the existing `put`/`get` interface.
+It additionally implements `BatchedCacheStorage.get_many(keys)`, which
+`ChunkedPrefixCache.lookup` detects automatically. The server walks the
+ordered keys and stops at the first miss, returning only leading hits.
+Later keys are not read or made more recent. The ordinary backend path
+still hashes and reads one chunk at a time. Neither path is a multi-chunk
+transaction: another client may evict entries between reads.
+
+Each request opens one TCP connection. Frames carry a four-byte
+big-endian body length, a JSON header followed by a newline, and opaque
+serializer bytes. A put includes its key and parent; a get includes its
+key list, and the response records each returned payload's byte length.
+Both sides use the same `Serializer` (JSON by default), with no pickle or
+base64 in the protocol. Custom serializers must support concurrent calls
+on the server. Frames are limited to 64 MiB and headers to 64 KiB; reads
+check lengths and handle fragmented TCP delivery. Long get key lists are split
+into smaller requests, stopping before later batches on the first miss.
+An oversized individual key or put raises `ValueError`; an oversized server
+response becomes a miss for that batch. Earlier batches' hits are retained.
+
+Connection errors, timeouts, and malformed frames become misses or
+dropped writes. A dropped write may already have reached the server, so
+the client does not retry it. Client serialization and deserialization
+errors remain visible, as with `DiskKVCache`, so a mismatched serializer
+can be diagnosed. The default one-second timeout bounds each socket operation;
+it is not a whole-request deadline. This is a localhost teaching server,
+without authentication, encryption, discovery, or connection pooling.
+
+Run `uv run python -m nano_lmcache.server`, then run
+`uv run python examples/demo_remote_cache.py --store` and
+`uv run python examples/demo_remote_cache.py` in separate processes.
+The [remote-cache benchmark](remote-cache.md) measures per-chunk versus
+batched prefix reads on the same machine and explains the LMCache parallel.
 
 ### Optional INT8 KV compression
 

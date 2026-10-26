@@ -1,5 +1,6 @@
 """Storage interface the prefix cache depends on."""
 
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
 
@@ -33,4 +34,13 @@ class CacheStorage(Protocol):
 
     def get(self, key: str) -> object | None:
         """Return the payload for `key`, or None on a miss."""
+        ...
+
+
+@runtime_checkable
+class BatchedCacheStorage(CacheStorage, Protocol):
+    """Optional prefix reads, useful when each storage call costs a round trip."""
+
+    def get_many(self, keys: Sequence[str]) -> list[object]:
+        """Return leading hits only; do not fetch any key after the first miss."""
         ...

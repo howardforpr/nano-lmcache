@@ -1,12 +1,12 @@
 """Chunked prefix cache built on an in-memory KV store."""
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
 from nano_lmcache.core.chunking import chunk_tokens, make_chunk_key
 from nano_lmcache.core.metrics import CacheMetrics
 from nano_lmcache.storage.memory import MemoryKVCache
-from nano_lmcache.storage.protocol import CacheStorage
+from nano_lmcache.storage.protocol import BatchedCacheStorage, CacheStorage
 
 
 @dataclass(frozen=True)
@@ -64,6 +64,14 @@ class ChunkedPrefixCache:
         chunks = chunk_tokens(token_ids, self._chunk_size)
         return [chunk for chunk in chunks if len(chunk) == self._chunk_size]
 
+    def _chunk_keys(self, chunks: Sequence[tuple[int, ...]]) -> Iterator[str]:
+        prefix_key: str | None = None
+        for chunk in chunks:
+            prefix_key = make_chunk_key(
+                chunk, namespace=self._namespace, prefix_key=prefix_key
+            )
+            yield prefix_key
+
     def store(
         self, token_ids: Sequence[int],
         chunk_values: Sequence[object],
@@ -95,13 +103,7 @@ class ChunkedPrefixCache:
 
         prefix_key: str | None = None
 
-        for index, chunk in enumerate(complete_chunks):
-            key = make_chunk_key(
-                chunk,
-                namespace=self._namespace,
-                prefix_key=prefix_key
-            )
-
+        for index, key in enumerate(self._chunk_keys(complete_chunks)):
             if index >= start_chunk:
                 self._storage.put(
                     key,
@@ -113,25 +115,23 @@ class ChunkedPrefixCache:
     def lookup(self, token_ids: Sequence[int]) -> PrefixLookupResult:
         complete_chunks = self._complete_chunks(token_ids)
 
-        matched_chunks = 0
-        matched_tokens = 0
         values: list[object] = []
         keys: list[str] = []
+        candidates = self._chunk_keys(complete_chunks)
+        if isinstance(self._storage, BatchedCacheStorage):
+            keys = list(candidates)
+            values = self._storage.get_many(keys)
+            keys = keys[:len(values)]
+        else:
+            for key in candidates:
+                value = self._storage.get(key)
+                if value is None:
+                    break
+                values.append(value)
+                keys.append(key)
 
-        prefix_key: str | None = None
-        for chunk in complete_chunks:
-            key = make_chunk_key(
-                chunk, namespace=self._namespace, prefix_key=prefix_key
-            )
-            value = self._storage.get(key)
-            if value is None:
-                break
-
-            matched_chunks += 1
-            matched_tokens += len(chunk)
-            values.append(value)
-            keys.append(key)
-            prefix_key = key
+        matched_chunks = len(values)
+        matched_tokens = matched_chunks * self._chunk_size
 
         self._metrics.record_lookup(
             hit_chunks=matched_chunks,
