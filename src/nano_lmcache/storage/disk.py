@@ -31,7 +31,9 @@ import os
 import time
 import zlib
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
+from threading import Lock
 from typing import cast
 
 from nano_lmcache.storage.eviction import PrefixLRUIndex
@@ -58,7 +60,7 @@ def _has_matching_payload_crc32(header: EntryHeader, payload: bytes) -> bool:
 
 
 class DiskKVCache:
-    """Optionally bounded, prefix-safe cache persisted in a directory.
+    """Thread-safe, optionally bounded prefix cache persisted in a directory.
 
     Eviction follows the same rules as `MemoryKVCache`, through a shared
     `PrefixLRUIndex`; evicting an entry deletes its file.
@@ -75,6 +77,7 @@ class DiskKVCache:
         self._directory.mkdir(parents=True, exist_ok=True)
         self._serializer = serializer if serializer is not None else JsonSerializer()
         self._index = PrefixLRUIndex(max_entries)
+        self._lock = Lock()
         # Last-used times are written as file mtimes. Keeping them strictly
         # increasing makes the order exact even when two accesses land in
         # the same clock tick.
@@ -98,21 +101,25 @@ class DiskKVCache:
 
     @property
     def stats(self) -> StorageStats:
-        """Eviction, rejection, and corruption totals for this object."""
-        return self._index.stats
+        """A snapshot of eviction, rejection, and corruption totals."""
+        with self._lock:
+            return replace(self._index.stats)
 
     def __len__(self) -> int:
-        return len(self._index)
+        with self._lock:
+            return len(self._index)
 
     def __contains__(self, key: object) -> bool:
         """Whether `key` is stored; unlike `get`, does not count as a use."""
-        return key in self._index
+        with self._lock:
+            return key in self._index
 
     def parent_of(self, key: str) -> str | None:
         """The parent recorded for a stored `key`; KeyError if absent."""
-        if key not in self._index:
-            raise KeyError(key)
-        return self._index.parent_of(key)
+        with self._lock:
+            if key not in self._index:
+                raise KeyError(key)
+            return self._index.parent_of(key)
 
     def put(
         self,
@@ -121,53 +128,55 @@ class DiskKVCache:
         *,
         parent_key: str | None = None,
     ) -> None:
-        # Encode first: a payload that cannot be stored must not change the
-        # index or evict anything.
-        payload = self._serializer.dumps(value)
+        with self._lock:
+            # Encode first: a payload that cannot be stored must not change the
+            # index or evict anything.
+            payload = self._serializer.dumps(value)
 
-        decision = self._index.admit(key, parent_key)
-        # Victims are always leaves, so deleting them one at a time never
-        # leaves an orphan on disk, even if the process dies halfway.
-        for victim in decision.evicted:
-            self._path(victim).unlink(missing_ok=True)
+            decision = self._index.admit(key, parent_key)
+            # Victims are always leaves, so deleting them one at a time never
+            # leaves an orphan on disk, even if the process dies halfway.
+            for victim in decision.evicted:
+                self._path(victim).unlink(missing_ok=True)
 
-        if not decision.admitted:
-            return
+            if not decision.admitted:
+                return
 
-        # The chain position of an existing key never changes, so keep the
-        # parent recorded at first admission.
-        header = {
-            "key": key,
-            "parent_key": self._index.parent_of(key),
-            "payload_crc32": _payload_crc32(payload),
-        }
-        self._write_atomically(self._path(key), header, payload)
-        self._mark_used(self._path(key))
+            # The chain position of an existing key never changes, so keep the
+            # parent recorded at first admission.
+            header = {
+                "key": key,
+                "parent_key": self._index.parent_of(key),
+                "payload_crc32": _payload_crc32(payload),
+            }
+            self._write_atomically(self._path(key), header, payload)
+            self._mark_used(self._path(key))
 
     def get(self, key: str) -> object | None:
-        if key not in self._index:
-            return None
+        with self._lock:
+            if key not in self._index:
+                return None
 
-        path = self._path(key)
-        try:
-            header, payload = self._read(path)
-        except FileNotFoundError:
-            self._discard_subtree(key)
-            return None
-        except (OSError, ValueError, UnicodeDecodeError):
-            self._discard_subtree(key)
-            self._index.stats.corrupted_entries += 1
-            return None
-
-        if not _has_matching_payload_crc32(header, payload):
-            self._discard_subtree(key)
-            if "payload_crc32" in header:
+            path = self._path(key)
+            try:
+                header, payload = self._read(path)
+            except FileNotFoundError:
+                self._discard_subtree(key)
+                return None
+            except (OSError, ValueError, UnicodeDecodeError):
+                self._discard_subtree(key)
                 self._index.stats.corrupted_entries += 1
-            return None
+                return None
 
-        self._index.touch(key)
-        self._mark_used(path)
-        return self._serializer.loads(payload)
+            if not _has_matching_payload_crc32(header, payload):
+                self._discard_subtree(key)
+                if "payload_crc32" in header:
+                    self._index.stats.corrupted_entries += 1
+                return None
+
+            self._index.touch(key)
+            self._mark_used(path)
+            return self._serializer.loads(payload)
 
     def _discard_subtree(self, key: str) -> None:
         """Remove an unusable entry and every descendant from disk and index."""

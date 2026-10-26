@@ -481,6 +481,49 @@ the way LMCache keeps hot chunks in memory and the long tail on disk.
 `TieredStorage.tier_stats` counts hits per tier, misses, and promotions,
 which shows how much of the working set fits in the fast tier.
 
+### Threads and storage
+
+`MemoryKVCache`, `DiskKVCache`, and `TieredStorage` serialize their public
+storage operations with one lock per instance. The lock covers both the
+prefix index and the payload changes: locking only `PrefixLRUIndex` would
+let a reader observe a newly admitted key before its payload is stored.
+Membership, parent metadata, and memory byte totals use the same lock.
+`stats` and `tier_stats` return snapshots; fetch the property again for
+new totals. Mutating a snapshot does not change the backend counters.
+
+Disk serialization, file reads, atomic replacement, deletion, and mtime
+updates all stay inside the disk lock. A get cannot lose its file to an
+eviction halfway through, and concurrent same-key puts cannot share a
+temporary file. This simple synchronous design trades parallel I/O for
+straightforward locking. LMCache also locks backend metadata, but its
+worker-based disk backend releases the lock around loading and rechecks
+membership afterward. That extra coordination is not needed here.
+Recovery runs during construction, before the instance is shared.
+
+The tiered lock spans both tiers, including slow-hit parent lookup and
+promotion, so writes cannot leave the tiers in different overwrite orders.
+Access its tiers through the same `TieredStorage` while threads are active;
+direct writes or sharing them between wrappers bypass that coordination.
+Lock order is wrapper first, then one backend at a time. Serializer methods
+run under the disk lock and must not call back into that cache. Memory's
+`size_fn` runs outside the lock and must support concurrent calls.
+Removed memory payloads stay alive until the outermost storage operation
+unlocks, including both tier updates and promotion counters. Their finalizers
+can then inspect or write the cache without observing a half-finished update.
+
+The guarantee covers individual backend calls, not a multi-chunk transaction:
+another thread can evict a prefix between two chunk operations, causing a
+shorter lookup or a rejected suffix write. Use one `ChunkedPrefixCache` per
+thread with shared storage, so each thread owns its `CacheMetrics`. Payloads
+returned by memory are still references; callers must synchronize mutations.
+`CPUOffloadKVCache` and standalone `PrefixLRUIndex` are not made thread-safe.
+Disk locks are not process locks: use one cache object per directory, and
+do not open or modify that directory concurrently from another process.
+
+Run `uv run python examples/demo_tiered_storage.py` for shared-storage
+requests. The threaded unit test also yields between index admission and
+payload storage to expose the race that backend locks prevent.
+
 ### GPU to CPU offload
 
 `CPUOffloadKVCache(device="cuda")` keeps chunk tensors in CPU memory and

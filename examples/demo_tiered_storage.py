@@ -4,11 +4,12 @@
 
 Memory holds only 4 chunks; disk holds everything (write-through). Watch
 where each lookup is served from: memory, disk (then promoted), or neither.
-The last part simulates a restart: memory starts empty, disk does not.
+After a restart, several threads share the same storage instance.
 """
 
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from nano_lmcache.core.prefix_cache import ChunkedPrefixCache
@@ -77,6 +78,20 @@ def main() -> None:
             f"served from memory {stats.fast_hit_rate:.0%}, "
             f"{stats.promotions} chunks promoted from disk"
         )
+
+        def request(worker: int) -> int:
+            # Keep lookup metrics per thread; only storage is shared.
+            local = ChunkedPrefixCache(
+                chunk_size=CHUNK_SIZE, namespace="demo-model", storage=storage
+            )
+            tokens = document + [100 + worker, 200 + worker]
+            result = local.lookup(tokens)
+            local.store(tokens, [f"kv-{tokens[i]}" for i in range(0, len(tokens), 2)])
+            return result.matched_chunks
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            reused = list(pool.map(request, range(8)))
+        print(f"\nShared storage: 8 threaded requests reused {sum(reused)} chunks")
     finally:
         shutil.rmtree(directory, ignore_errors=True)
 

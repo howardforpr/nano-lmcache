@@ -21,9 +21,11 @@ Each tier enforces the prefix-safety invariant on its own (every entry's
 whole ancestor chain is in that tier), so their union does as well.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from threading import Lock
 from typing import Protocol, runtime_checkable
 
+from nano_lmcache.storage._lifetime import defer_release
 from nano_lmcache.storage.protocol import CacheStorage
 
 
@@ -85,12 +87,13 @@ class TierStats:
 
 
 class TieredStorage:
-    """Write-through, promote-on-hit combination of two backends."""
+    """Thread-safe, write-through, promote-on-hit combination of two backends."""
 
     def __init__(self, *, fast: FastTier, slow: SlowTier) -> None:
         self._fast = fast
         self._slow = slow
         self._tier_stats = TierStats()
+        self._lock = Lock()
 
     @property
     def fast(self) -> FastTier:
@@ -102,11 +105,14 @@ class TieredStorage:
 
     @property
     def tier_stats(self) -> TierStats:
-        return self._tier_stats
+        """A snapshot of lookup and promotion totals."""
+        with self._lock:
+            return replace(self._tier_stats)
 
     def __contains__(self, key: object) -> bool:
         """Whether either tier has `key`; does not promote or count a use."""
-        return key in self._fast or key in self._slow
+        with self._lock:
+            return key in self._fast or key in self._slow
 
     def put(
         self,
@@ -115,30 +121,32 @@ class TieredStorage:
         *,
         parent_key: str | None = None,
     ) -> None:
-        # Slow tier first: if it raises (for example, a payload it cannot
-        # serialize), the fast tier is left untouched.
-        self._slow.put(key, value, parent_key=parent_key)
-        if isinstance(self._fast, _AdmissionAwareFastTier):
-            if not self._fast.try_put(key, value, parent_key=parent_key):
-                # The slow tier has the current value. A rejected overwrite
-                # must not leave an older fast copy (or orphan its children).
-                self._fast.invalidate(key)
-        else:
-            self._fast.put(key, value, parent_key=parent_key)
+        with defer_release(), self._lock:
+            # Slow tier first: if it raises (for example, a payload it cannot
+            # serialize), the fast tier is left untouched.
+            self._slow.put(key, value, parent_key=parent_key)
+            if isinstance(self._fast, _AdmissionAwareFastTier):
+                if not self._fast.try_put(key, value, parent_key=parent_key):
+                    # The slow tier has the current value. A rejected overwrite
+                    # must not leave an older fast copy (or orphan its children).
+                    self._fast.invalidate(key)
+            else:
+                self._fast.put(key, value, parent_key=parent_key)
 
     def get(self, key: str) -> object | None:
-        value = self._fast.get(key)
-        if value is not None:
-            self._tier_stats.fast_hits += 1
+        with defer_release(), self._lock:
+            value = self._fast.get(key)
+            if value is not None:
+                self._tier_stats.fast_hits += 1
+                return value
+
+            value = self._slow.get(key)
+            if value is None:
+                self._tier_stats.misses += 1
+                return None
+
+            self._tier_stats.slow_hits += 1
+            self._fast.put(key, value, parent_key=self._slow.parent_of(key))
+            if key in self._fast:
+                self._tier_stats.promotions += 1
             return value
-
-        value = self._slow.get(key)
-        if value is None:
-            self._tier_stats.misses += 1
-            return None
-
-        self._tier_stats.slow_hits += 1
-        self._fast.put(key, value, parent_key=self._slow.parent_of(key))
-        if key in self._fast:
-            self._tier_stats.promotions += 1
-        return value
